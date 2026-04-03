@@ -1,142 +1,220 @@
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
+const https = require('https');
 const http = require('http');
 
-// ============ إعدادات - عدّلها ============
-const TOKEN = process.env.TOKEN;           // توكن البوت
-const CLIENT_ID = process.env.CLIENT_ID;  // ID البوت
-const ANNOUNCE_CHANNEL = process.env.CHANNEL_ID; // ID روم الإعلانات
-const ROBLOX_SECRET = process.env.ROBLOX_SECRET; // كلمة سر سرية بينك وبين Roblox
-// ==========================================
+const TOKEN = process.env.TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
+const UNIVERSE_ID = process.env.UNIVERSE_ID;
+const ROBLOX_API_KEY = process.env.ROBLOX_API_KEY;
+const ROBLOX_SECRET = process.env.ROBLOX_SECRET;
+
+// روم لكل فريق + روم الكل - عدّلها
+const CHANNELS = {
+    Police: process.env.CHANNEL_POLICE,
+    SWAT: process.env.CHANNEL_SWAT,
+    Civilian: process.env.CHANNEL_CIVILIAN,
+    all: process.env.CHANNEL_ALL
+};
+
+// ID الرسائل المثبتة عشان نعدّل عليها
+const pinnedMessages = {
+    Police: null,
+    SWAT: null,
+    Civilian: null,
+    all: null
+};
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
+function sendToRoblox(data) {
+    const body = JSON.stringify({
+        message: JSON.stringify({ secret: ROBLOX_SECRET, ...data })
+    });
+    const options = {
+        hostname: 'apis.roblox.com',
+        path: `/messaging-service/v1/universes/${UNIVERSE_ID}/topics/DiscordCommands`,
+        method: 'POST',
+        headers: {
+            'x-api-key': ROBLOX_API_KEY,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body)
+        }
+    };
+    const req = https.request(options);
+    req.on('error', e => console.error('خطأ:', e));
+    req.write(body);
+    req.end();
+}
+
+// استقبال بيانات من Roblox عبر polling
+function pollRoblox() {
+    const options = {
+        hostname: 'apis.roblox.com',
+        path: `/messaging-service/v1/universes/${UNIVERSE_ID}/topics/RobloxToDiscord`,
+        method: 'GET',
+        headers: { 'x-api-key': ROBLOX_API_KEY }
+    };
+    // ملاحظة: Roblox لا يدعم polling مباشر
+    // نستخدم نظام push من Roblox
+}
+
+function buildTeamEmbed(teamName, members) {
+    const colors = { Police: 0x3498DB, SWAT: 0x2ECC71, Civilian: 0xE67E22 };
+    const emojis = { Police: '👮', SWAT: '🪖', Civilian: '👤' };
+
+    const embed = new EmbedBuilder()
+        .setTitle(`${emojis[teamName] || '👥'} فريق ${teamName}`)
+        .setColor(colors[teamName] || 0x5865F2)
+        .setTimestamp();
+
+    if (members.length === 0) {
+        embed.setDescription('لا يوجد أعضاء متواجدين حالياً');
+    } else {
+        const list = members.map((m, i) => `${i + 1}. ${m}`).join('\n');
+        embed.setDescription(list);
+        embed.setFooter({ text: `المجموع: ${members.length} لاعب` });
+    }
+    return embed;
+}
+
+function buildAllEmbed(teams) {
+    const emojis = { Police: '👮', SWAT: '🪖', Civilian: '👤' };
+    const embed = new EmbedBuilder()
+        .setTitle('📊 إحصائيات الفرق')
+        .setColor(0x5865F2)
+        .setTimestamp();
+
+    let total = 0;
+    for (const [team, members] of Object.entries(teams)) {
+        total += members.length;
+        embed.addFields({
+            name: `${emojis[team] || '👥'} ${team} (${members.length})`,
+            value: members.length > 0 ? members.join(', ') : 'لا يوجد',
+            inline: false
+        });
+    }
+    embed.setFooter({ text: `إجمالي اللاعبين: ${total}` });
+    return embed;
+}
+
+async function updateMessage(channelId, messageId, embed) {
+    try {
+        const channel = client.channels.cache.get(channelId);
+        if (!channel) return null;
+
+        if (messageId) {
+            try {
+                const msg = await channel.messages.fetch(messageId);
+                await msg.edit({ embeds: [embed] });
+                return messageId;
+            } catch {
+                // الرسالة انحذفت، نرسل جديدة
+            }
+        }
+        const sent = await channel.send({ embeds: [embed] });
+        return sent.id;
+    } catch (e) {
+        console.error('خطأ في تحديث الرسالة:', e);
+        return null;
+    }
+}
+
 // تسجيل الأوامر
 const commands = [
-  new SlashCommandBuilder()
-    .setName('panel')
-    .setDescription('افتح لوحة التحكم')
+    new SlashCommandBuilder()
+        .setName('staff')
+        .setDescription('عرض المتواجدين في فريق معين')
+        .addStringOption(opt =>
+            opt.setName('team')
+                .setDescription('اسم الفريق')
+                .setRequired(true)
+                .addChoices(
+                    { name: 'Police', value: 'Police' },
+                    { name: 'SWAT', value: 'SWAT' },
+                    { name: 'Civilian', value: 'Civilian' }
+                )
+        ),
+    new SlashCommandBuilder()
+        .setName('allstaff')
+        .setDescription('عرض جميع الفرق ومتواجديها')
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
 
 client.once('ready', async () => {
-  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-  console.log(`✅ البوت شغال: ${client.user.tag}`);
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+    console.log(`✅ البوت شغال: ${client.user.tag}`);
 });
-
-// متغيرات الريستارت
-let restartTimer = null;
-let minutesLeft = 5;
-let restartChannelId = null;
 
 client.on('interactionCreate', async interaction => {
+    if (!interaction.isChatInputCommand()) return;
 
-  // ===== أمر /panel =====
-  if (interaction.isChatInputCommand() && interaction.commandName === 'panel') {
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('btn_announce').setLabel('📢 إرسال تنبيه').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('btn_restart').setLabel('🔄 إعلان ريستارت').setStyle(ButtonStyle.Danger)
-    );
-    await interaction.reply({ content: '### 🎮 لوحة التحكم', components: [row], ephemeral: true });
-  }
+    if (interaction.commandName === 'staff') {
+        const team = interaction.options.getString('team');
+        await interaction.reply({ content: `⏳ جاري جلب بيانات ${team}...`, ephemeral: true });
+        sendToRoblox({ type: 'get_team', teamName: team });
+    }
 
-  // ===== زر التنبيه العام =====
-  if (interaction.isButton() && interaction.customId === 'btn_announce') {
-    const modal = new ModalBuilder().setCustomId('modal_announce').setTitle('📢 إرسال تنبيه');
-    modal.addComponents(
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('title').setLabel('عنوان التنبيه').setStyle(TextInputStyle.Short).setRequired(true)
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('message').setLabel('نص التنبيه').setStyle(TextInputStyle.Paragraph).setRequired(true)
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId('duration').setLabel('مدة العرض (بالثواني) - اتركه فاضي إذا ما تبي').setStyle(TextInputStyle.Short).setRequired(false)
-      )
-    );
-    await interaction.showModal(modal);
-  }
-
-  // ===== إرسال التنبيه =====
-  if (interaction.isModalSubmit() && interaction.customId === 'modal_announce') {
-    const title = interaction.fields.getTextInputValue('title');
-    const message = interaction.fields.getTextInputValue('message');
-    const duration = interaction.fields.getTextInputValue('duration') || '0';
-
-    const channel = client.channels.cache.get(ANNOUNCE_CHANNEL);
-    const embed = new EmbedBuilder()
-      .setTitle(`📢 ${title}`)
-      .setDescription(message)
-      .setColor(0x5865F2)
-      .setFooter({ text: `أرسله: ${interaction.user.username}` })
-      .setTimestamp();
-
-    await channel.send({ content: '@everyone', embeds: [embed] });
-
-    // أرسل للـ Roblox
-    sendToRoblox({ type: 'announce', title, message, duration: parseInt(duration) });
-
-    await interaction.reply({ content: '✅ تم إرسال التنبيه!', ephemeral: true });
-  }
-
-  // ===== زر الريستارت =====
-  if (interaction.isButton() && interaction.customId === 'btn_restart') {
-    restartChannelId = interaction.channelId;
-    minutesLeft = 5;
-
-    const channel = client.channels.cache.get(ANNOUNCE_CHANNEL);
-    const embed = new EmbedBuilder()
-      .setTitle('🔄 تنبيه ريستارت!')
-      .setDescription('**ريستارت قادم بعد 5 دقائق!**\nجهّزوا أنفسكم وضعوا أغراضكم بالخزنة 🗃️')
-      .setColor(0xFF0000)
-      .setTimestamp();
-
-    await channel.send({ content: '@everyone', embeds: [embed] });
-    sendToRoblox({ type: 'restart_start', minutes: 5 });
-
-    await interaction.reply({ content: '✅ بدأ العداد! سيتم إشعار الأعضاء كل دقيقة.', ephemeral: true });
-
-    // عداد كل دقيقة
-    restartTimer = setInterval(async () => {
-      minutesLeft--;
-      const ch = client.channels.cache.get(ANNOUNCE_CHANNEL);
-
-      if (minutesLeft === 1) {
-        const embed1 = new EmbedBuilder()
-          .setTitle('⚠️ باقي دقيقة واحدة!')
-          .setDescription('**سيتم سحب جميع اللاعبين للبداية لوضع الأغراض بالخزنة!**')
-          .setColor(0xFF6600);
-        await ch.send({ content: '@everyone', embeds: [embed1] });
-        sendToRoblox({ type: 'restart_1min' });
-
-      } else if (minutesLeft <= 0) {
-        clearInterval(restartTimer);
-        const embed0 = new EmbedBuilder()
-          .setTitle('🔴 الريستارت الآن!')
-          .setDescription('**جاري إعادة تشغيل جميع سيرفرات الماب...**')
-          .setColor(0x000000);
-        await ch.send({ content: '@everyone', embeds: [embed0] });
-        sendToRoblox({ type: 'restart_now' });
-
-      } else {
-        const embedN = new EmbedBuilder()
-          .setTitle(`⏳ باقي ${minutesLeft} دقائق على الريستارت`)
-          .setColor(0xFFA500);
-        await ch.send({ embeds: [embedN] });
-        sendToRoblox({ type: 'restart_countdown', minutes: minutesLeft });
-      }
-    }, 60000); // كل دقيقة
-  }
+    if (interaction.commandName === 'allstaff') {
+        await interaction.reply({ content: '⏳ جاري جلب بيانات جميع الفرق...', ephemeral: true });
+        sendToRoblox({ type: 'get_all' });
+    }
 });
 
-// ===== إرسال أوامر للـ Roblox عبر HTTP =====
-function sendToRoblox(data) {
-  const body = JSON.stringify({ secret: ROBLOX_SECRET, ...data });
-  // هذا يحتاج Roblox HttpService - سنشرحه في الجزء الثاني
-  console.log('📤 إرسال للـ Roblox:', body);
-}
+// استقبال بيانات من Roblox عبر webhook endpoint
+const server = http.createServer(async (req, res) => {
+    if (req.method === 'POST' && req.url === '/roblox') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', async () => {
+            try {
+                const data = JSON.parse(body);
+                if (data.secret !== ROBLOX_SECRET) {
+                    res.writeHead(403);
+                    res.end('Forbidden');
+                    return;
+                }
 
-// سيرفر بسيط عشان Replit ما يوقف البوت
-http.createServer((req, res) => res.end('Bot is running!')).listen(3000);
+                if (data.type === 'team_response' || data.type === 'auto_update_team') {
+                    const team = data.teamName;
+                    const channelId = CHANNELS[team];
+                    if (channelId) {
+                        const embed = buildTeamEmbed(team, data.members || []);
+                        pinnedMessages[team] = await updateMessage(channelId, pinnedMessages[team], embed);
+                    }
+                }
 
+                if (data.type === 'all_response' || data.type === 'auto_update') {
+                    // تحديث روم الكل
+                    const channelId = CHANNELS.all;
+                    if (channelId) {
+                        const embed = buildAllEmbed(data.teams || {});
+                        pinnedMessages.all = await updateMessage(channelId, pinnedMessages.all, embed);
+                    }
+
+                    // تحديث كل روم فريق
+                    for (const [team, members] of Object.entries(data.teams || {})) {
+                        const channelId = CHANNELS[team];
+                        if (channelId) {
+                            const embed = buildTeamEmbed(team, members);
+                            pinnedMessages[team] = await updateMessage(channelId, pinnedMessages[team], embed);
+                        }
+                    }
+                }
+
+                res.writeHead(200);
+                res.end('OK');
+            } catch (e) {
+                console.error(e);
+                res.writeHead(500);
+                res.end('Error');
+            }
+        });
+    } else {
+        res.writeHead(200);
+        res.end('Bot is running!');
+    }
+});
+
+server.listen(3000);
 client.login(TOKEN);
