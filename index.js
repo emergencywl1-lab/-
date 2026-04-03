@@ -47,8 +47,8 @@ async function updateListMessage(client) {
 // ─── DISCORD CLIENT ──────────────
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// v15 ready fix
-client.once("clientReady", () => console.log(`✅ ${client.user.tag} شغّال`));
+// ready event لـ v14
+client.once("ready", () => console.log(`✅ ${client.user.tag} شغّال`));
 
 client.login(DISCORD_TOKEN);
 
